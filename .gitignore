@@ -1,0 +1,13 @@
+# VS Code workspace file
+*.code-workspace
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Logs
+Logs/
+*.log

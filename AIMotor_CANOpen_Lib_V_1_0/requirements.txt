@@ -1,0 +1,6 @@
+canopen>=2.3
+python-can>=4.5
+
+# adapter backends - install the one you use
+gs-usb>=0.3      # CANable2 (gs_usb)
+canalystii>=0.1  # CANalyst-II
