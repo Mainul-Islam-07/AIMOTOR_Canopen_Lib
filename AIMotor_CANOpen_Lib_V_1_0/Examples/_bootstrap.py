@@ -22,20 +22,34 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     parser.add_argument("--config", default=None,
                         help="Path to aimotor_config.json (default: the library's Config folder)")
     parser.add_argument("--profile", default=None,
-                        help="Adapter profile from the config: canable2, canalystii, virtual")
-    parser.add_argument("--motor", default="AIMotor_1", help="Motor name from the config")
+                        help="Override the adapter profile for this motor (default: the "
+                             "motor's own 'adapter' key in the config)")
+    parser.add_argument("--motor", default="Left", help="Motor name from the config")
     parser.add_argument("--verbose", action="store_true", help="Log every SDO transaction")
     return parser
 
 
 def load(args):
-    """Return (Config, CANopen_Network) for the parsed arguments."""
+    """Return (Config, CANopen_Network) on the adapter this motor lives on."""
     from AIMotor_CANOpen_Lib_V_1_0.CANopen_Network.Network_Lib import CANopen_Network
     from AIMotor_CANOpen_Lib_V_1_0.Housekeeping.Config_Lib import Config
 
     config = Config(args.config, profile=args.profile)
-    network = CANopen_Network(config)
+    profile = config.motor_adapter(args.motor, args.profile)
+    network = CANopen_Network(config, profile=profile)
     return config, network
+
+
+def load_group(args, names=None):
+    """Return (Config, Motor_Group) covering several motors and their buses."""
+    from AIMotor_CANOpen_Lib_V_1_0.Housekeeping.Config_Lib import Config
+    from AIMotor_CANOpen_Lib_V_1_0.Motor_Control.Motor_Group_Lib import Motor_Group
+
+    config = Config(args.config, profile=args.profile)
+    group = Motor_Group(config, names=names, profile=args.profile,
+                        setup_mode=getattr(args, "setup_mode", True),
+                        strict=getattr(args, "strict", False))
+    return config, group
 
 
 def banner(title: str):

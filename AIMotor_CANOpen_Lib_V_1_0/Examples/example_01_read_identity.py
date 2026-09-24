@@ -35,6 +35,10 @@ def main() -> int:
         print("  Supported modes   0x%08X -> %s" % (report["supported_modes_raw"] or 0,
                                                     " ".join(report["supported_modes"])))
         print("  H02-00            %s (8 = CANopen control mode)" % report["H02_00"])
+        print("  Nameplate         %s rpm rated, %s rpm max, %s Nm, %s A"
+              % (report["rated_speed_rpm"], report["max_speed_rpm"],
+                 report["rated_torque_nm"], report["rated_current_a"]))
+        print("  Config speed cap  %.0f rpm" % report["configured_limit_rpm"])
         print("  Statusword        0x%04X  %s" % (report["statusword"] or 0, report["state"]))
         print("  Position actual   %s pul (%.3f rev)" %
               (report["position_pul"], motor.units.pul_to_rev(report["position_pul"] or 0)))

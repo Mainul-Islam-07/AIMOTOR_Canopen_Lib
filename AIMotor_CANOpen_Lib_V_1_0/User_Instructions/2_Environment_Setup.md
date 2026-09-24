@@ -34,11 +34,38 @@ The factory default is 1 (pulse/direction).
 Confirm from the CAN side with `Examples/example_01_read_identity.py`, which
 reads `0x2002:01` and prints the value.
 
-## Node id and bitrate
+## Node id and bitrate - which register is which
 
-Factory default is **node 1, 500 kbps**. Change them on the drive with H0C_00
-(node id) and H0C_08 (CAN bitrate), then set `motors.<name>.node_id` in
-`Config/aimotor_config.json` to match.
+| Parameter | Register | Modbus address | CANopen object | This setup |
+|---|---|---|---|---|
+| **Node id** | **H0C_00** | 0x0C00 | **0x200C:01** | Left = 1, Right = 2 |
+| CAN bitrate | H0C_08 | 0x0C08 | 0x200C:09 | 6 = 1 Mbps (5 = 500 kbps) |
+| RS485 address | H0C_00 | 0x0C00 | 0x200C:01 | same register as the node id |
+| RS485 baud | H0C_02 | 0x0C02 | 0x200C:03 | 5 = 57600 |
+| Save to EEPROM | H0C_13 | 0x0C0D | 0x200C:0E | write 1 after any change |
+
+Change them with the AIMOTOR RS485 tool, write **H0C_13 = 1** to save, then
+power-cycle. Afterwards set `motors.<name>.node_id` in the config to match.
+
+Reading them back over CAN is a quick sanity check:
+
+```python
+motor.io.read(OD.NODE_ID)       # 0x200C:01, H0C_00
+motor.io.read(OD.CAN_BITRATE)   # 0x200C:09, H0C_08
+```
+
+## Two motors, two buses
+
+This setup gives each motor its own CANable2 and its own bus:
+
+| Motor | Node id | Adapter profile | USB serial |
+|---|---|---|---|
+| Left | 1 | `canable2_left` | 002900573945501820303651 |
+| Right | 2 | `canable2_right` | 003E00354845500F20303750 |
+
+Each bus needs its own 120 ohm termination at both ends. Node ids only have to
+be unique per bus, so two motors on separate buses could both be node 1 - these
+are 1 and 2, which also keeps a future single-bus rewire trouble free.
 
 ## Startup checklist
 

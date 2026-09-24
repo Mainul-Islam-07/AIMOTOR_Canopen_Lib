@@ -1,8 +1,8 @@
 {
-    "config_version": "1.0",
-    "_comment": "Single configuration file for the AIMOTOR CANopen library. Edit paths / adapter / motors here - nothing is hardcoded in the Python sources.",
+    "config_version": "1.1",
+    "_comment": "Single configuration file for the AIMOTOR CANopen library. Edit paths / adapters / motors here - nothing is hardcoded in the Python sources.",
 
-    "profile": "canable2",
+    "profile": "canable2_left",
 
     "paths": {
         "_comment": "base_dir null = folder of this library (derived from __file__). Put an absolute path here to move the library. Relative paths are resolved against base_dir.",
@@ -12,29 +12,47 @@
     },
 
     "adapters": {
+        "_comment": "One entry per physical CAN adapter. Each motor names the adapter its bus is on. 'serial' pins a profile to one physical CANable2 - gs_usb index order is NOT stable across replug. Read serials with Examples/example_00_list_adapters.py.",
+
+        "canable2_left": {
+            "interface": "gs_usb",
+            "channel": "canable2_left",
+            "index": 0,
+            "serial": "002900573945501820303651",
+            "bitrate": 1000000,
+            "notes": "LEFT motor bus, node 1. Separate physical adapter and separate CAN bus. 250000 bps crashes libusb on this PC - do not use."
+        },
+        "canable2_right": {
+            "interface": "gs_usb",
+            "channel": "canable2_right",
+            "index": 1,
+            "serial": "003E00354845500F20303750",
+            "bitrate": 1000000,
+            "notes": "RIGHT motor bus, node 2. Separate physical adapter and separate CAN bus."
+        },
         "canable2": {
             "interface": "gs_usb",
             "channel": "canable2",
             "index": 0,
-            "bitrate": 500000,
-            "notes": "DEFAULT. 250000 bps crashes libusb on this PC - keep 500000."
+            "bitrate": 1000000,
+            "notes": "Single-bus fallback. Same device as canable2_left when only one adapter is plugged in."
         },
         "canalystii": {
             "interface": "canalystii",
             "channel": 0,
-            "bitrate": 500000,
-            "notes": "Second adapter. Motor is wired to CAN1, which is channel 0."
+            "bitrate": 1000000,
+            "notes": "Alternative adapter. Motor is wired to CAN1, which is channel 0."
         },
         "socketcan": {
             "interface": "socketcan",
             "channel": "can0",
-            "bitrate": 500000,
+            "bitrate": 1000000,
             "notes": "For a future Linux / ROS2 host."
         },
         "virtual": {
             "interface": "virtual",
             "channel": "aimotor_test",
-            "bitrate": 500000,
+            "bitrate": 1000000,
             "notes": "Offline dry run, no hardware needed."
         }
     },
@@ -60,9 +78,9 @@
         "stop_before_disarm": true,
         "disarm_on_exit": true,
         "disconnect_on_exit": true,
-        "os_exit_after_disconnect": true,
+        "os_exit_after_disconnect": false,
         "os_exit_code": 0,
-        "notes": "os_exit_after_disconnect skips interpreter teardown, where the gs_usb libusb driver raises an access violation on this PC. The motor is always disarmed first. Set false on CANalyst-II for a normal exit."
+        "notes": "MUST stay false with more than one motor: exiting during teardown would leave the other motor armed. Motor_Group forces it false and disarms every motor before any bus is closed."
     },
 
     "logging": {
@@ -81,8 +99,8 @@
 
         "pulses_per_rev": 1000,
         "gear_ratio": 1.0,
-        "rated_torque_nm": 0.32,
-        "rated_current_a": 6.0,
+        "rated_torque_nm": 2.39,
+        "rated_current_a": 19.0,
 
         "require_canopen_mode": true,
         "canopen_mode_value": 8,
@@ -104,9 +122,9 @@
         },
 
         "limits": {
-            "_comment": "This drive has no 0x6072/0x6080 object, so limits MUST be enforced in software before every write.",
+            "_comment": "Drive nameplate: rated 3000 rpm, hard max 3600 rpm (H00_15). No 0x6072/0x6080 object exists, so these limits are enforced in software before every write.",
             "enforce_in_software": true,
-            "max_velocity_rpm": 500.0,
+            "max_velocity_rpm": 3000.0,
             "max_acceleration_rpm_s": 1000.0,
             "max_deceleration_rpm_s": 1000.0,
             "max_position_pul": 2000000,
@@ -115,8 +133,8 @@
         },
 
         "profile": {
-            "_comment": "Units are Pul/s and Pul/s^2. At 1000 pulses/rev: 16667 pul/s = 1000 rpm.",
-            "maximal_profile_velocity_pulps": 16667,
+            "_comment": "Units are Pul/s and Pul/s^2. At 1000 pulses/rev: 16667 pul/s = 1000 rpm, 50000 pul/s = 3000 rpm.",
+            "maximal_profile_velocity_pulps": 50000,
             "profile_velocity_pulps": 8333,
             "profile_acceleration_pulps2": 16667,
             "profile_deceleration_pulps2": 16667,
@@ -125,15 +143,24 @@
     },
 
     "motors": {
-        "AIMotor_1": {
+        "Left": {
             "node_id": 1,
             "enabled": true,
-            "description": "AIMOTOR low voltage servo, node 1, 500 kbps."
+            "adapter": "canable2_left",
+            "description": "AIMOTOR servo, node 1 (H0C_00=1), 1 Mbps (H0C_08=6), on its own CANable2."
         },
-        "AIMotor_2": {
+        "Right": {
             "node_id": 2,
-            "enabled": false,
-            "description": "Reserved for the second motor. Set its node id on the drive (H0C_00), then set enabled true."
+            "enabled": true,
+            "adapter": "canable2_right",
+            "description": "AIMOTOR servo, node 2 (H0C_00=2), 1 Mbps (H0C_08=6), on its own CANable2."
         }
+    },
+
+    "pairing": {
+        "_comment": "Used by the paired drive controls in the GUI and by example_06. invert_right_for_forward true suits a differential base, where the right wheel faces the other way, so a positive forward command drives straight.",
+        "left_motor": "Left",
+        "right_motor": "Right",
+        "invert_right_for_forward": true
     }
 }

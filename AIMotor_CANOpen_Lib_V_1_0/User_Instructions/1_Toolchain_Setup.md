@@ -39,8 +39,16 @@ python -c "import libusb_package,sys,os,shutil; shutil.copy(libusb_package.get_l
 
 ## Known quirks on this hardware
 
-- **CANable2 at 250 kbps crashes libusb.** Only 500000 is in the shipped config.
+- **CANable2 at 250 kbps crashes libusb.** The shipped config uses 1000000,
+  which is verified working on both adapters.
+- **Two adapters in one process** is fine, but a stale process holding a device
+  gives `[Errno 13] Access denied` on the next run. Close the old process, or
+  replug, and note that the library never hard-exits while a bus is open.
+- **gs_usb index order is not stable.** Each adapter profile carries a USB
+  `serial` so a replug cannot swap Left and Right. Read the serials with
+  `Examples/example_00_list_adapters.py`.
 - **CANable2 sometimes raises an access violation when the bus closes.** The
-  option `shutdown.os_exit_after_disconnect` leaves the process immediately
-  after the motor is disarmed, which side-steps it. Set it `false` when using
-  the CANalyst-II, which shuts down cleanly.
+  option `shutdown.os_exit_after_disconnect` side-steps it by leaving the
+  process right after the motor is disarmed. It ships **false**, because with
+  two motors a hard exit could skip the second motor's disarm. `Motor_Group`
+  forces it false and disarms every motor before any bus is closed.

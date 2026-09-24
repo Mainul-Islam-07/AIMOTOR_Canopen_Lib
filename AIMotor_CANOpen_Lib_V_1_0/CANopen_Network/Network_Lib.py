@@ -14,6 +14,7 @@ import canopen
 from ..Housekeeping.Common_Lib import Common
 from ..Housekeeping.Config_Lib import Config
 from ..Housekeeping.Logger_Lib import Logger
+from .Adapter_Resolve_Lib import resolve_adapter_kwargs
 
 
 class CANopen_Network():
@@ -43,7 +44,7 @@ class CANopen_Network():
     def setup_network(self):
         """Open the CAN bus with the adapter settings from the config."""
         try:
-            kwargs = {k: v for k, v in self.adapter.items() if k != "profile_name"}
+            kwargs = resolve_adapter_kwargs(self.adapter, self.log)
             self.network = canopen.Network()
             self.network.connect(**kwargs)
             self.bus = self.network.bus

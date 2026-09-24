@@ -16,8 +16,8 @@
 ```python
 from AIMotor_CANOpen_Lib_V_1_0 import CANopen_Network, Motor_CANopen_Lib
 
-with CANopen_Network() as net:
-    with Motor_CANopen_Lib("AIMotor_1", net) as motor:
+with CANopen_Network(profile="canable2_left") as net:
+    with Motor_CANopen_Lib("Left", net) as motor:
         motor.preflight()
         motor.arm()
         motor.velocity.RUN_rpm(60)
@@ -27,18 +27,25 @@ with CANopen_Network() as net:
 
 ## Two motors
 
-Enable the second entry in the config, then:
+Use `Motor_Group`. It opens one bus per adapter, so it covers both a motor per
+adapter and two motors sharing one bus, without code changes:
 
 ```python
-with CANopen_Network() as net:
-    motors = [Motor_CANopen_Lib(name, net) for name in net.config.motor_names()]
-    for m in motors:
-        m.preflight()
+from AIMotor_CANOpen_Lib_V_1_0 import Motor_Group
+
+with Motor_Group() as group:
+    group.preflight_all()
+    group.arm_all()
+    group.drive(forward_rpm=30, turn_rpm=0)     # differential mixer
+    print(group.snapshot_all()["Left"]["velocity_rpm"])
+    group["Right"].velocity.RUN_rpm(-10)        # or one motor directly
 ```
 
-Each motor keeps its own settings, telemetry and feedback poller. At 10 Hz, two
-motors over SDO is comfortable; four is not — that is what the PDO transport
-will be for.
+Leaving the block stops and disarms **every** motor before closing any bus.
+See `7_Two_Motors.md` for the mixer, adapter pinning and shutdown order.
+
+Each motor keeps its own settings, telemetry and feedback poller. At 10 Hz and
+1 Mbps, two motors over SDO is comfortable; four would need the PDO transport.
 
 ## Changing mode at runtime
 

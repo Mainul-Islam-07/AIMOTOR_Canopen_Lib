@@ -1,21 +1,22 @@
-"""Example 5 - desktop GUI to control the AIMOTOR and watch its feedback.
+"""Example 5 - desktop GUI for both AIMOTOR drives.
 
     python example_05_gui.py
-    python example_05_gui.py --profile canalystii
+    python example_05_gui.py --motors Left Right
+    python example_05_gui.py --motor Left          # single panel
 
 Tkinter only, no extra dependencies.
 
-THIS CAN MOVE THE MOTOR. Arming asks for confirmation first, and closing the
-window always stops and disarms.
+THIS CAN MOVE THE MOTORS. Arming asks for confirmation, the big STOP stops
+every motor at any time, and closing the window stops and disarms both.
 
-Design: all CAN work happens on one background thread (CanWorker). The GUI
-never touches the bus directly - it posts commands to a queue and reads
-results from another queue, because Tk widgets may only be touched from the
-main thread.
+Design: all CAN work happens on ONE background thread (CanWorker) that owns a
+Motor_Group, so both buses are torn down in a known order. The GUI never
+touches the bus - it posts commands to a queue and reads results from another
+queue, because Tk widgets may only be touched from the main thread. Every
+per-motor command and event carries a "motor" key; "*" means all of them.
 """
 
 import argparse
-import os
 import queue
 import sys
 import threading
@@ -36,24 +37,25 @@ COLOR_WARN = "#d29922"
 COLOR_FAULT = "#f85149"
 COLOR_ACCENT = "#58a6ff"
 
+ALL = "*"
+
 
 class CanWorker(threading.Thread):
-    """Owns the CANopen network and the motor. Talks to the GUI by queue."""
+    """Owns the Motor_Group. Talks to the GUI by queue."""
 
     def __init__(self, commands: queue.Queue, events: queue.Queue, config_path=None,
-                 profile=None, motor_name="AIMotor_1"):
+                 profile=None, motor_names=None):
         super().__init__(daemon=True, name="can-worker")
         self.commands = commands
         self.events = events
         self.config_path = config_path
         self.profile = profile
-        self.motor_name = motor_name
+        self.motor_names = motor_names or []
 
         self.config = None
-        self.network = None
-        self.motor = None
+        self.group = None
         self.connected = False
-        self.armed = False
+        self.armed = {}
         self.poll_period = 0.2
         self._running = True
 
@@ -78,121 +80,184 @@ class CanWorker(threading.Thread):
                 except Exception as e:
                     self.log(str(e), "error")
                     self.emit("busy", False)
-            if self.connected and self.motor is not None and time.time() >= next_poll:
+            if self.connected and self.group is not None and time.time() >= next_poll:
                 next_poll = time.time() + self.poll_period
-                try:
-                    self.emit("feedback", self.motor.snapshot())
-                except Exception as e:
-                    self.log("Feedback error: " + str(e), "error")
+                for name, motor in list(self.group):
+                    try:
+                        data = dict(motor.snapshot())
+                        data["motor"] = name
+                        self.emit("feedback", data)
+                    except Exception as e:
+                        self.log("Feedback error [" + name + "]: " + str(e), "error")
         self.shutdown()
+        self.emit("shutdown_done", None)
 
     def handle(self, command, args):
         handler = getattr(self, "cmd_" + command, None)
         if handler is None:
             self.log("Unknown command: " + str(command), "error")
             return
-        handler(args)
+        handler(args or {})
+
+    def targets(self, args) -> list:
+        """Which motors a command applies to. Missing or '*' means all."""
+        if self.group is None:
+            return []
+        name = (args or {}).get("motor", ALL)
+        if name in (ALL, None):
+            return self.group.online()
+        return [name] if name in self.group else []
+
+    def per_motor(self, args, action, label, level_ok="info"):
+        """Run one action per target motor; one failure never blocks the rest."""
+        for name in self.targets(args):
+            try:
+                ok = action(self.group[name], name)
+                self.log("[" + name + "] " + label + ("" if ok is not False else " FAILED"),
+                         level_ok if ok is not False else "error")
+            except Exception as e:
+                self.log("[" + name + "] " + label + " error: " + str(e), "error")
 
     # ------------------------------------------------------------- commands
 
     def cmd_connect(self, args):
-        from AIMotor_CANOpen_Lib_V_1_0.CANopen_Network.Network_Lib import CANopen_Network
         from AIMotor_CANOpen_Lib_V_1_0.Housekeeping.Config_Lib import Config
-        from AIMotor_CANOpen_Lib_V_1_0.Motor_Control.Motor_Lib import Motor_CANopen_Lib
+        from AIMotor_CANOpen_Lib_V_1_0.Motor_Control.Motor_Group_Lib import Motor_Group
 
         self.emit("busy", True)
-        self.profile = (args or {}).get("profile", self.profile)
-        self.motor_name = (args or {}).get("motor", self.motor_name)
-
         self.config = Config(self.config_path, profile=self.profile)
-        # The GUI closes the bus itself, so never hard-exit the process.
-        self.config.shutdown["os_exit_after_disconnect"] = False
-        adapter = self.config.adapter()
-        self.log("Connecting: %s / %s / %s bps" % (adapter.get("interface"),
-                                                   adapter.get("channel"),
-                                                   adapter.get("bitrate")))
-        self.network = CANopen_Network(self.config)
-        self.motor = Motor_CANopen_Lib(self.motor_name, self.network, self.config)
-        self.connected = True
-        self.poll_period = float(self.motor.settings.feedback.get("poll_period_s", 0.2))
+        names = self.motor_names or self.config.motor_names(enabled_only=True)
+        for warning in getattr(self.config, "warnings", []):
+            self.log(warning, "warn")
 
-        limits = self.motor.settings.limits
-        self.emit("connected", {
-            "motor": self.motor_name,
-            "node_id": self.motor.Node_ID,
-            "max_rpm": float(limits.get("max_velocity_rpm", 500.0)),
-            "mode": self.motor.mode.current if self.motor.mode else None,
-            "profile": adapter.get("profile_name"),
-        })
-        self.log("Connected to %s (node %d)" % (self.motor_name, self.motor.Node_ID), "ok")
-        self.cmd_preflight(None)
+        self.log("Opening " + str(len(set(self.config.motor_adapter(n, self.profile)
+                                          for n in names))) + " bus(es) for " +
+                 ", ".join(names))
+        self.group = Motor_Group(self.config, names=names, profile=self.profile, strict=False)
+        self.connected = True
+        self.armed = {name: False for name in self.group.online()}
+
+        periods = [float(self.group[n].settings.feedback.get("poll_period_s", 0.2))
+                   for n in self.group.online()] or [0.2]
+        self.poll_period = max(0.2, min(periods))
+
+        for name in self.group.online():
+            motor = self.group[name]
+            self.emit("motor_online", {
+                "motor": name,
+                "node_id": motor.Node_ID,
+                "adapter": self.group.adapter_of(name),
+                "max_rpm": float(motor.settings.limits.get("max_velocity_rpm", 3000.0)),
+                "mode": motor.mode.current if motor.mode else None,
+            })
+            self.log("[" + name + "] online: node " + str(motor.Node_ID) + " on " +
+                     self.group.adapter_of(name), "ok")
+        for name, error in self.group.failures.items():
+            self.emit("motor_offline", {"motor": name, "error": str(error)})
+            self.log("[" + name + "] offline: " + str(error), "error")
+
+        self.emit("connected", {"motors": self.group.online(),
+                                "pairing": self.config.pairing()})
+        self.cmd_preflight({"motor": ALL})
         self.emit("busy", False)
 
     def cmd_preflight(self, args):
-        report = self.motor.preflight()
-        for problem in report.get("problems", []):
-            self.log(problem, "error")
-        self.log("Preflight %s - state %s, H02-00 %s, modes %s"
-                 % ("PASS" if report["ok"] else "FAIL", report["state"], report["H02_00"],
-                    " ".join(report["supported_modes"])), "ok" if report["ok"] else "error")
-        self.emit("preflight", report)
+        for name in self.targets(args):
+            report = self.group[name].preflight()
+            for problem in report.get("problems", []):
+                self.log("[" + name + "] " + problem, "error")
+            self.log("[" + name + "] preflight " + ("PASS" if report["ok"] else "FAIL") +
+                     " - state " + str(report["state"]) + ", H02-00 " + str(report["H02_00"]),
+                     "ok" if report["ok"] else "error")
+            report["motor"] = name
+            self.emit("preflight", report)
 
     def cmd_arm(self, args):
         self.emit("busy", True)
-        self.log("Arming - the motor becomes energised")
-        ok = self.motor.arm()
-        self.armed = bool(ok)
-        self.emit("armed", self.armed)
-        self.log("ARMED" if ok else "ARM failed", "ok" if ok else "error")
+        for name in self.targets(args):
+            self.log("[" + name + "] arming - the motor becomes energised", "warn")
+            ok = bool(self.group[name].arm())
+            self.armed[name] = ok
+            self.emit("armed", {"motor": name, "armed": ok})
+            self.log("[" + name + "] " + ("ARMED" if ok else "ARM failed"),
+                     "ok" if ok else "error")
         self.emit("busy", False)
 
     def cmd_disarm(self, args):
         self.emit("busy", True)
-        self.motor.stop()
-        ok = self.motor.disarm()
-        self.armed = False
-        self.emit("armed", False)
-        self.log("Disarmed" if ok else "Disarm reported errors", "ok" if ok else "error")
+        for name in self.targets(args):
+            try:
+                self.group[name].stop()
+                ok = self.group[name].disarm()
+            except Exception as e:
+                ok = False
+                self.log("[" + name + "] disarm error: " + str(e), "error")
+            self.armed[name] = False
+            self.emit("armed", {"motor": name, "armed": False})
+            self.emit("target", {"motor": name, "rpm": 0.0})
+            self.log("[" + name + "] disarmed" if ok else "[" + name + "] disarm had errors",
+                     "ok" if ok else "error")
         self.emit("busy", False)
 
     def cmd_stop(self, args):
-        """Zero the setpoint but stay enabled."""
-        self.motor.stop()
-        self.emit("target", 0.0)
-        self.log("STOP - setpoint zeroed", "warn")
+        """Zero the setpoint. Stays enabled, and always works."""
+        for name in self.targets(args):
+            try:
+                self.group[name].stop()
+                self.emit("target", {"motor": name, "rpm": 0.0})
+                self.log("[" + name + "] STOP - setpoint zeroed", "warn")
+            except Exception as e:
+                self.log("[" + name + "] STOP error: " + str(e), "error")
 
     def cmd_quick_stop(self, args):
-        self.motor.quick_stop()
-        self.armed = False
-        self.emit("armed", False)
-        self.log("QUICK STOP", "warn")
+        for name in self.targets(args):
+            self.group[name].quick_stop()
+            self.armed[name] = False
+            self.emit("armed", {"motor": name, "armed": False})
+            self.log("[" + name + "] QUICK STOP", "warn")
+
+    def cmd_fault_reset(self, args):
+        self.per_motor(args, lambda m, n: m.fault_reset(), "fault reset", "ok")
 
     def cmd_velocity(self, args):
         rpm = float(args.get("rpm", 0.0))
-        if self.motor.velocity is None:
-            self.log("Velocity mode is not active - switch mode first", "error")
-            return
-        pulps = self.motor.velocity.RUN_rpm(rpm)
-        if pulps is None:
-            self.log("Velocity command failed", "error")
-            return
-        actual_rpm = self.motor.units.pulps_to_rpm(pulps)
-        self.emit("target", actual_rpm)
-        self.log("Target %.1f rpm (%d pul/s)" % (actual_rpm, pulps))
+        for name in self.targets(args):
+            motor = self.group[name]
+            if motor.velocity is None:
+                self.log("[" + name + "] velocity mode is not active", "error")
+                continue
+            pulps = motor.velocity.RUN_rpm(rpm)
+            if pulps is None:
+                self.log("[" + name + "] velocity command failed", "error")
+                continue
+            actual = motor.units.pulps_to_rpm(pulps)
+            self.emit("target", {"motor": name, "rpm": actual})
+            self.log("[" + name + "] target %.1f rpm (%d pul/s)" % (actual, pulps))
+
+    def cmd_pair_velocity(self, args):
+        """Differential drive: both motors in one worker-side call."""
+        forward = float(args.get("forward", 0.0))
+        turn = float(args.get("turn", 0.0))
+        invert = args.get("invert")
+        results = self.group.drive(forward, turn, invert_right=invert)
+        for name, pulps in results.items():
+            if pulps is None:
+                continue
+            actual = self.group[name].units.pulps_to_rpm(pulps)
+            self.emit("target", {"motor": name, "rpm": actual})
+        self.log("Paired drive: forward %.1f rpm, turn %.1f rpm -> %s"
+                 % (forward, turn, {k: v for k, v in results.items()}))
 
     def cmd_mode(self, args):
         mode = int(args.get("mode"))
-        if self.armed:
-            self.log("Disarm before changing mode", "error")
-            return
-        ok = self.motor.mode.switch_to(mode)
-        self.emit("mode", self.motor.mode.current)
-        self.log("Mode set to %s" % self.motor.mode.current, "ok" if ok else "error")
-
-    def cmd_fault_reset(self, args):
-        ok = self.motor.fault_reset()
-        self.log("Fault reset %s" % ("succeeded" if ok else "failed"),
-                 "ok" if ok else "error")
+        for name in self.targets(args):
+            if self.armed.get(name):
+                self.log("[" + name + "] disarm before changing mode", "error")
+                continue
+            ok = self.group[name].mode.switch_to(mode)
+            self.emit("mode", {"motor": name, "mode": self.group[name].mode.current})
+            self.log("[" + name + "] mode set to " + str(self.group[name].mode.current),
+                     "ok" if ok else "error")
 
     def cmd_disconnect(self, args):
         self.shutdown()
@@ -205,23 +270,20 @@ class CanWorker(threading.Thread):
     # -------------------------------------------------------------- cleanup
 
     def shutdown(self):
+        """Group teardown: every motor disarmed before any bus is closed."""
         try:
-            if self.motor is not None:
-                self.motor.close()
+            if self.group is not None:
+                self.group.close_all()
         except Exception as e:
             self.log("Shutdown error: " + str(e), "error")
-        try:
-            if self.network is not None:
-                self.network.disconnect(hard_exit=False)
-        except Exception:
-            pass
-        self.motor = None
-        self.network = None
+        self.group = None
         self.connected = False
-        self.armed = False
+        self.armed = {}
 
 
-class MotorGUI():
+class MotorPanel():
+    """One motor: its own controls and feedback fields."""
+
     FIELDS = [
         ("state", "State"),
         ("statusword_hex", "Status word"),
@@ -229,7 +291,6 @@ class MotorGUI():
         ("position_pul", "Position [pul]"),
         ("position_rev", "Position [rev]"),
         ("velocity_rpm", "Velocity [rpm]"),
-        ("velocity_pulps", "Velocity [pul/s]"),
         ("torque_percent", "Torque [% rated]"),
         ("torque_nm", "Torque [Nm]"),
         ("phase_current_a", "Phase current [A]"),
@@ -238,38 +299,229 @@ class MotorGUI():
         ("error_code", "Error code"),
         ("fault_code", "Fault code"),
         ("heartbeat_state", "Heartbeat"),
-        ("target_reached", "Target reached"),
     ]
 
+    def __init__(self, parent, name, send):
+        self.name = name
+        self.send = send
+        self.online = False
+        self.armed = False
+        self.max_rpm = 3000.0
+        self.value_labels = {}
+        self._last_sent_rpm = None
+
+        self.frame = ttk.LabelFrame(parent, text=name)
+        self.info = tk.Label(self.frame, text="not connected", bg=COLOR_PANEL, fg=COLOR_MUTED,
+                             font=("Segoe UI", 9))
+        self.info.grid(row=0, column=0, columnspan=4, sticky="w", padx=8, pady=(4, 2))
+
+        controls = ttk.Frame(self.frame)
+        controls.grid(row=1, column=0, columnspan=4, sticky="we", padx=4, pady=2)
+        self.arm_btn = ttk.Button(controls, text="ARM", width=8, command=self.on_arm)
+        self.arm_btn.grid(row=0, column=0, padx=2)
+        self.disarm_btn = ttk.Button(controls, text="Disarm", width=8,
+                                     command=lambda: self.send("disarm", motor=self.name))
+        self.disarm_btn.grid(row=0, column=1, padx=2)
+        self.fault_btn = ttk.Button(controls, text="Fault reset", width=11,
+                                    command=lambda: self.send("fault_reset", motor=self.name))
+        self.fault_btn.grid(row=0, column=2, padx=2)
+        self.mode_var = tk.StringVar(value="3 - PV velocity")
+        self.mode_box = ttk.Combobox(controls, textvariable=self.mode_var, width=15,
+                                     state="readonly",
+                                     values=["3 - PV velocity", "1 - PP position",
+                                             "4 - PT torque"])
+        self.mode_box.grid(row=0, column=3, padx=6)
+        self.mode_box.bind("<<ComboboxSelected>>", self.on_mode)
+        self.armed_label = tk.Label(controls, text="DISARMED", bg=COLOR_PANEL, fg=COLOR_MUTED,
+                                    font=("Segoe UI", 10, "bold"))
+        self.armed_label.grid(row=0, column=4, padx=8)
+
+        speed = ttk.Frame(self.frame)
+        speed.grid(row=2, column=0, columnspan=4, sticky="we", padx=4, pady=2)
+        self.speed_var = tk.DoubleVar(value=0.0)
+        self.slider = tk.Scale(speed, from_=-self.max_rpm, to=self.max_rpm, resolution=10,
+                               orient="horizontal", length=330, variable=self.speed_var,
+                               bg=COLOR_PANEL, fg=COLOR_TEXT, highlightthickness=0,
+                               troughcolor=COLOR_BG, activebackground=COLOR_ACCENT,
+                               sliderlength=26, label="rpm")
+        self.slider.grid(row=0, column=0, columnspan=3, sticky="we", padx=4)
+        self.slider.bind("<ButtonRelease-1>", lambda e: self.on_slider())
+        self.speed_entry = ttk.Entry(speed, width=9)
+        self.speed_entry.insert(0, "0")
+        self.speed_entry.grid(row=1, column=0, padx=4, sticky="w")
+        self.speed_entry.bind("<Return>", lambda e: self.on_entry())
+        self.send_btn = ttk.Button(speed, text="Send", width=7, command=self.on_entry)
+        self.send_btn.grid(row=1, column=1, sticky="w")
+        self.target_label = tk.Label(speed, text="target 0.0 rpm", bg=COLOR_PANEL,
+                                     fg=COLOR_ACCENT, font=("Segoe UI", 9))
+        self.target_label.grid(row=1, column=2, sticky="w", padx=8)
+
+        fields = ttk.Frame(self.frame)
+        fields.grid(row=3, column=0, columnspan=4, sticky="we", padx=4, pady=(4, 6))
+        for i, (key, label) in enumerate(self.FIELDS):
+            row, col = i % 7, i // 7
+            ttk.Label(fields, text=label, foreground=COLOR_MUTED).grid(
+                row=row, column=col * 2, sticky="w", padx=(6, 4), pady=1)
+            value = tk.Label(fields, text="-", bg=COLOR_PANEL, fg=COLOR_TEXT,
+                             font=("Consolas", 9), anchor="w", width=17)
+            value.grid(row=row, column=col * 2 + 1, sticky="w", padx=(0, 10))
+            self.value_labels[key] = value
+        self.update_widget_states()
+
+    # ------------------------------------------------------------- actions
+
+    def on_arm(self):
+        if not messagebox.askokcancel(
+                "Arm " + self.name,
+                "The " + self.name + " motor will be energised and can start turning.\n\n"
+                "Check the shaft is clear and the motor is secured.\n\nContinue?"):
+            return
+        self.send("arm", motor=self.name)
+
+    def on_mode(self, event=None):
+        self.send("mode", motor=self.name, mode=int(self.mode_var.get().split(" ")[0]))
+
+    def on_slider(self):
+        rpm = float(self.speed_var.get())
+        self.speed_entry.delete(0, "end")
+        self.speed_entry.insert(0, str(rpm))
+        self._send_rpm(rpm)
+
+    def on_entry(self):
+        try:
+            rpm = float(self.speed_entry.get())
+        except ValueError:
+            return
+        self.speed_var.set(max(-self.max_rpm, min(self.max_rpm, rpm)))
+        self._send_rpm(rpm)
+
+    def _send_rpm(self, rpm):
+        if not self.armed and rpm != 0:
+            self.send("_log", text="[" + self.name + "] arm before commanding a speed",
+                      level="warn")
+            return
+        if rpm == self._last_sent_rpm:
+            return
+        self._last_sent_rpm = rpm
+        self.send("velocity", motor=self.name, rpm=rpm)
+
+    def zero_slider(self):
+        self.speed_var.set(0.0)
+        self.speed_entry.delete(0, "end")
+        self.speed_entry.insert(0, "0")
+        self._last_sent_rpm = None
+
+    # -------------------------------------------------------------- display
+
+    def set_online(self, online, info_text="", error=""):
+        self.online = bool(online)
+        if online:
+            self.info.configure(text=info_text, fg=COLOR_OK)
+        else:
+            self.info.configure(text=("offline: " + error) if error else "not connected",
+                                fg=COLOR_FAULT if error else COLOR_MUTED)
+            self.clear()
+        self.update_widget_states()
+
+    def set_max_rpm(self, value):
+        self.max_rpm = float(value)
+        self.slider.configure(from_=-self.max_rpm, to=self.max_rpm)
+
+    def set_armed(self, armed):
+        self.armed = bool(armed)
+        self.armed_label.configure(text="ARMED" if armed else "DISARMED",
+                                   fg=COLOR_FAULT if armed else COLOR_MUTED)
+        if not armed:
+            self._last_sent_rpm = None
+        self.update_widget_states()
+
+    def set_target(self, rpm):
+        self.target_label.configure(text="target %.1f rpm" % float(rpm))
+
+    def set_mode(self, mode):
+        for text in self.mode_box["values"]:
+            if text.startswith(str(mode)):
+                self.mode_var.set(text)
+                return
+
+    def show_feedback(self, data):
+        for key, _ in self.FIELDS:
+            value = data.get(key)
+            if key in ("error_code", "fault_code") and isinstance(value, int):
+                text = "0x%04X" % value
+            elif isinstance(value, float):
+                text = "%.2f" % value
+            else:
+                text = str(value)
+            self.value_labels[key].configure(text=text)
+        state_label = self.value_labels["state"]
+        if data.get("fault"):
+            state_label.configure(fg=COLOR_FAULT)
+        elif data.get("state") == "OPERATION_ENABLED":
+            state_label.configure(fg=COLOR_OK)
+        else:
+            state_label.configure(fg=COLOR_TEXT)
+        for key in ("error_code", "fault_code"):
+            self.value_labels[key].configure(
+                fg=COLOR_FAULT if data.get(key) else COLOR_TEXT)
+
+    def clear(self):
+        for label in self.value_labels.values():
+            label.configure(text="-", fg=COLOR_TEXT)
+        self.set_armed(False)
+        self.zero_slider()
+
+    def update_widget_states(self):
+        on = "normal" if self.online else "disabled"
+        for widget in (self.disarm_btn, self.fault_btn, self.send_btn, self.speed_entry):
+            widget.configure(state=on)
+        self.slider.configure(state=on)
+        self.mode_box.configure(state="readonly" if self.online else "disabled")
+        self.arm_btn.configure(state="disabled" if (self.armed or not self.online) else "normal")
+
+
+class MotorGUI():
     def __init__(self, root, args):
         self.root = root
         self.args = args
         self.commands = queue.Queue()
         self.events = queue.Queue()
-        self.worker = CanWorker(self.commands, self.events, args.config,
-                                args.profile, args.motor)
+
+        self.motor_names = self._configured_motors()
+        self.worker = CanWorker(self.commands, self.events, args.config, args.profile,
+                                self.motor_names)
         self.worker.start()
 
         self.connected = False
-        self.armed = False
-        self.max_rpm = 500.0
-        self.value_labels = {}
-        self._last_sent_rpm = None
+        self.panels = {}
+        self.pairing = {}
+        self._closing = False
 
         root.title("AIMOTOR CANopen control")
         root.configure(bg=COLOR_BG)
-        root.minsize(780, 560)
-        root.geometry("860x690+60+15")
+        root.minsize(1150, 700)
+        root.geometry("1240x820+30+10")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self._build_styles()
         self._build_connection_row()
-        self._build_control_row()
-        self._build_velocity_row()
-        self._build_feedback_panel()
+        self._build_panels()
+        self._build_pair_row()
         self._build_log()
         self._update_widget_states()
         self.root.after(POLL_UI_MS, self._drain_events)
+
+    def _configured_motors(self):
+        if self.args.motors:
+            return list(self.args.motors)
+        if self.args.motor:
+            return [self.args.motor]
+        try:
+            from AIMotor_CANOpen_Lib_V_1_0.Housekeeping.Config_Lib import Config
+            return Config(self.args.config, profile=self.args.profile).motor_names()
+        except Exception as e:
+            messagebox.showerror("Config error", str(e))
+            return []
 
     # ---------------------------------------------------------------- layout
 
@@ -281,198 +533,143 @@ class MotorGUI():
             pass
         style.configure("TLabel", background=COLOR_PANEL, foreground=COLOR_TEXT)
         style.configure("TFrame", background=COLOR_PANEL)
-        style.configure("TLabelframe", background=COLOR_PANEL, foreground=COLOR_MUTED)
-        style.configure("TLabelframe.Label", background=COLOR_PANEL, foreground=COLOR_MUTED)
-        style.configure("TButton", padding=6)
-        style.configure("TCombobox", padding=4)
-
-    def _panel(self, title=None):
-        frame = ttk.LabelFrame(self.root, text=title) if title else ttk.Frame(self.root)
-        frame.pack(fill="x", padx=10, pady=6)
-        return frame
+        style.configure("TLabelframe", background=COLOR_PANEL, foreground=COLOR_ACCENT)
+        style.configure("TLabelframe.Label", background=COLOR_PANEL, foreground=COLOR_ACCENT)
+        style.configure("TButton", padding=4)
+        style.configure("TRadiobutton", background=COLOR_PANEL, foreground=COLOR_TEXT)
 
     def _build_connection_row(self):
-        frame = self._panel("Connection")
-        ttk.Label(frame, text="Adapter").grid(row=0, column=0, padx=6, pady=8, sticky="w")
-        self.profile_var = tk.StringVar(value=self.args.profile or "")
-        self.profile_box = ttk.Combobox(frame, textvariable=self.profile_var, width=14,
-                                        state="readonly")
-        self.profile_box.grid(row=0, column=1, padx=6)
-
-        ttk.Label(frame, text="Motor").grid(row=0, column=2, padx=6, sticky="w")
-        self.motor_var = tk.StringVar(value=self.args.motor)
-        self.motor_box = ttk.Combobox(frame, textvariable=self.motor_var, width=14,
-                                      state="readonly")
-        self.motor_box.grid(row=0, column=3, padx=6)
-
+        frame = ttk.LabelFrame(self.root, text="Connection")
+        frame.pack(fill="x", padx=10, pady=(8, 4))
         self.connect_btn = ttk.Button(frame, text="Connect", command=self.on_connect)
-        self.connect_btn.grid(row=0, column=4, padx=10)
+        self.connect_btn.grid(row=0, column=0, padx=8, pady=6)
+        self.conn_label = tk.Label(frame, text="disconnected", bg=COLOR_PANEL, fg=COLOR_MUTED,
+                                   font=("Segoe UI", 10, "bold"))
+        self.conn_label.grid(row=0, column=1, padx=10, sticky="w")
+        tk.Label(frame, text="motors: " + ", ".join(self.motor_names), bg=COLOR_PANEL,
+                 fg=COLOR_MUTED, font=("Segoe UI", 9)).grid(row=0, column=2, padx=20)
 
-        self.conn_label = tk.Label(frame, text="disconnected", bg=COLOR_PANEL,
-                                   fg=COLOR_MUTED, font=("Segoe UI", 10, "bold"))
-        self.conn_label.grid(row=0, column=5, padx=10, sticky="w")
-        self._populate_choices()
+    def _build_panels(self):
+        holder = ttk.Frame(self.root)
+        holder.pack(fill="both", expand=False, padx=6, pady=2)
+        for column, name in enumerate(self.motor_names):
+            panel = MotorPanel(holder, name, self.send)
+            panel.frame.grid(row=0, column=column, sticky="nsew", padx=4)
+            holder.grid_columnconfigure(column, weight=1)
+            self.panels[name] = panel
 
-    def _populate_choices(self):
-        """Read the adapter profiles and motor names out of the JSON config."""
-        try:
-            from AIMotor_CANOpen_Lib_V_1_0.Housekeeping.Config_Lib import Config
-            config = Config(self.args.config, profile=self.args.profile)
-            self.profile_box["values"] = sorted(config.raw.get("adapters", {}))
-            if not self.profile_var.get():
-                self.profile_var.set(config.profile)
-            self.motor_box["values"] = config.motor_names(enabled_only=False)
-            if self.motor_var.get() not in self.motor_box["values"]:
-                self.motor_var.set(config.motor_names()[0])
-        except Exception as e:
-            messagebox.showerror("Config error", str(e))
+    def _build_pair_row(self):
+        frame = ttk.LabelFrame(self.root, text="Paired drive (both motors)")
+        frame.pack(fill="x", padx=10, pady=4)
 
-    def _build_control_row(self):
-        frame = self._panel("Drive control")
-        self.arm_btn = ttk.Button(frame, text="ARM", command=self.on_arm)
-        self.arm_btn.grid(row=0, column=0, padx=6, pady=8)
-        self.disarm_btn = ttk.Button(frame, text="Disarm", command=self.on_disarm)
-        self.disarm_btn.grid(row=0, column=1, padx=6)
+        self.forward_var = tk.DoubleVar(value=0.0)
+        self.forward_slider = tk.Scale(frame, from_=-3000, to=3000, resolution=10,
+                                       orient="horizontal", length=330,
+                                       variable=self.forward_var, label="forward rpm",
+                                       bg=COLOR_PANEL, fg=COLOR_TEXT, highlightthickness=0,
+                                       troughcolor=COLOR_BG, activebackground=COLOR_ACCENT,
+                                       sliderlength=26)
+        self.forward_slider.grid(row=0, column=0, rowspan=2, padx=8, pady=4)
+        self.forward_slider.bind("<ButtonRelease-1>", lambda e: self.on_pair_drive())
 
-        ttk.Label(frame, text="Mode").grid(row=0, column=2, padx=(20, 6))
-        self.mode_var = tk.StringVar(value="3 - PV velocity")
-        self.mode_box = ttk.Combobox(frame, textvariable=self.mode_var, width=18,
-                                     state="readonly",
-                                     values=["3 - PV velocity", "1 - PP position",
-                                             "4 - PT torque"])
-        self.mode_box.grid(row=0, column=3, padx=6)
-        self.mode_box.bind("<<ComboboxSelected>>", self.on_mode)
+        self.turn_var = tk.DoubleVar(value=0.0)
+        self.turn_slider = tk.Scale(frame, from_=-1000, to=1000, resolution=10,
+                                    orient="horizontal", length=260, variable=self.turn_var,
+                                    label="turn rpm", bg=COLOR_PANEL, fg=COLOR_TEXT,
+                                    highlightthickness=0, troughcolor=COLOR_BG,
+                                    activebackground=COLOR_ACCENT, sliderlength=26)
+        self.turn_slider.grid(row=0, column=1, rowspan=2, padx=8, pady=4)
+        self.turn_slider.bind("<ButtonRelease-1>", lambda e: self.on_pair_drive())
 
-        self.fault_btn = ttk.Button(frame, text="Fault reset", command=self.on_fault_reset)
-        self.fault_btn.grid(row=0, column=4, padx=(20, 6))
+        self.invert_var = tk.BooleanVar(value=True)
+        ttk.Radiobutton(frame, text="Opposite (differential base)", variable=self.invert_var,
+                        value=True, command=self.on_pair_drive).grid(row=0, column=2,
+                                                                     sticky="w", padx=8)
+        ttk.Radiobutton(frame, text="Same direction", variable=self.invert_var, value=False,
+                        command=self.on_pair_drive).grid(row=1, column=2, sticky="w", padx=8)
 
-        self.armed_label = tk.Label(frame, text="DISARMED", bg=COLOR_PANEL, fg=COLOR_MUTED,
-                                    font=("Segoe UI", 11, "bold"))
-        self.armed_label.grid(row=0, column=5, padx=16)
+        self.arm_both_btn = ttk.Button(frame, text="ARM BOTH", command=self.on_arm_both)
+        self.arm_both_btn.grid(row=0, column=3, padx=8, pady=2, sticky="we")
+        self.disarm_both_btn = ttk.Button(frame, text="DISARM BOTH",
+                                          command=lambda: self.send("disarm", motor=ALL))
+        self.disarm_both_btn.grid(row=1, column=3, padx=8, pady=2, sticky="we")
 
-    def _build_velocity_row(self):
-        frame = self._panel("Velocity command")
-        self.speed_var = tk.DoubleVar(value=0.0)
-        self.slider = tk.Scale(frame, from_=-self.max_rpm, to=self.max_rpm, resolution=1,
-                               orient="horizontal", length=430, variable=self.speed_var, sliderlength=28,
-                               bg=COLOR_PANEL, fg=COLOR_TEXT, highlightthickness=0,
-                               troughcolor=COLOR_BG, activebackground=COLOR_ACCENT,
-                               label="rpm")
-        self.slider.grid(row=0, column=0, columnspan=3, padx=8, pady=4, sticky="we")
-        self.slider.bind("<ButtonRelease-1>", lambda e: self.on_send_velocity())
-
-        ttk.Label(frame, text="rpm").grid(row=1, column=0, padx=(8, 2), sticky="e")
-        self.speed_entry = ttk.Entry(frame, width=10)
-        self.speed_entry.insert(0, "0")
-        self.speed_entry.grid(row=1, column=1, padx=4, sticky="w")
-        self.speed_entry.bind("<Return>", lambda e: self.on_send_entry())
-        self.send_btn = ttk.Button(frame, text="Send", command=self.on_send_entry)
-        self.send_btn.grid(row=1, column=2, padx=6, sticky="w")
-
-        self.stop_btn = tk.Button(frame, text="STOP", command=self.on_stop,
-                                  bg=COLOR_FAULT, fg="white", font=("Segoe UI", 16, "bold"),
-                                  width=10, height=2, relief="raised",
-                                  activebackground="#ff7b72")
-        self.stop_btn.grid(row=0, column=3, rowspan=2, padx=18, pady=6)
-
-        self.target_label = tk.Label(frame, text="target 0.0 rpm", bg=COLOR_PANEL,
-                                     fg=COLOR_ACCENT, font=("Segoe UI", 10))
-        self.target_label.grid(row=1, column=4, padx=10, sticky="w")
-
-    def _build_feedback_panel(self):
-        frame = self._panel("Feedback")
-        for i, (key, label) in enumerate(self.FIELDS):
-            row, col = i % 8, i // 8
-            ttk.Label(frame, text=label, foreground=COLOR_MUTED).grid(
-                row=row, column=col * 2, sticky="w", padx=(10, 6), pady=2)
-            value = tk.Label(frame, text="-", bg=COLOR_PANEL, fg=COLOR_TEXT,
-                             font=("Consolas", 10), anchor="w", width=18)
-            value.grid(row=row, column=col * 2 + 1, sticky="w", padx=(0, 16))
-            self.value_labels[key] = value
+        self.stop_btn = tk.Button(frame, text="STOP\nBOTH", command=self.on_stop_all,
+                                  bg=COLOR_FAULT, fg="white", font=("Segoe UI", 15, "bold"),
+                                  width=9, height=2, activebackground="#ff7b72")
+        self.stop_btn.grid(row=0, column=4, rowspan=2, padx=16, pady=4)
 
     def _build_log(self):
-        frame = self._panel("Log")
-        self.log_text = tk.Text(frame, height=6, bg=COLOR_BG, fg=COLOR_TEXT,
+        frame = ttk.LabelFrame(self.root, text="Log")
+        frame.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+        self.log_text = tk.Text(frame, height=7, bg=COLOR_BG, fg=COLOR_TEXT,
                                 insertbackground=COLOR_TEXT, font=("Consolas", 9),
                                 wrap="word", relief="flat")
         scroll = ttk.Scrollbar(frame, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scroll.set)
-        self.log_text.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=6)
-        scroll.pack(side="right", fill="y", pady=6)
-        self.log_text.tag_config("ok", foreground=COLOR_OK)
-        self.log_text.tag_config("warn", foreground=COLOR_WARN)
-        self.log_text.tag_config("error", foreground=COLOR_FAULT)
-        self.log_text.tag_config("info", foreground=COLOR_TEXT)
+        self.log_text.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=4)
+        scroll.pack(side="right", fill="y", pady=4)
+        for tag, color in (("ok", COLOR_OK), ("warn", COLOR_WARN), ("error", COLOR_FAULT),
+                           ("info", COLOR_TEXT)):
+            self.log_text.tag_config(tag, foreground=color)
 
     # --------------------------------------------------------------- actions
 
     def send(self, command, **args):
+        if command == "_log":                     # panels log without a round trip
+            self.log(args.get("text", ""), args.get("level", "info"))
+            return
         self.commands.put((command, args))
 
     def on_connect(self):
         if self.connected:
             self.send("disconnect")
             return
-        self.log("Connecting...", "info")
-        self.send("connect", profile=self.profile_var.get(), motor=self.motor_var.get())
+        self.log("Connecting...")
+        self.send("connect")
 
-    def on_arm(self):
+    def on_arm_both(self):
+        live = [n for n, p in self.panels.items() if p.online]
+        if len(live) < 2:
+            self.log("ARM BOTH needs both motors online", "warn")
+            return
         if not messagebox.askokcancel(
-                "Arm the drive",
-                "The motor will be energised and can start turning.\n\n"
-                "Check the shaft is clear and the motor is secured.\n\nContinue?"):
+                "Arm both motors",
+                "BOTH motors will be energised and can start turning.\n\n"
+                "Check both shafts are clear and both motors are secured.\n\nContinue?"):
             return
-        self.send("arm")
+        self.send("arm", motor=ALL)
 
-    def on_disarm(self):
-        self.send("disarm")
+    def on_stop_all(self):
+        """Always available. Zeroes every setpoint and every slider."""
+        self.forward_var.set(0.0)
+        self.turn_var.set(0.0)
+        for panel in self.panels.values():
+            panel.zero_slider()
+        self.send("stop", motor=ALL)
 
-    def on_stop(self):
-        """Always available: zero the setpoint, then disarm if it was armed."""
-        self.speed_var.set(0.0)
-        self.speed_entry.delete(0, "end")
-        self.speed_entry.insert(0, "0")
-        self.send("stop")
-
-    def on_mode(self, event=None):
-        mode = int(self.mode_var.get().split(" ")[0])
-        self.send("mode", mode=mode)
-
-    def on_fault_reset(self):
-        self.send("fault_reset")
-
-    def on_send_velocity(self):
-        rpm = float(self.speed_var.get())
-        self.speed_entry.delete(0, "end")
-        self.speed_entry.insert(0, str(rpm))
-        self._send_rpm(rpm)
-
-    def on_send_entry(self):
-        try:
-            rpm = float(self.speed_entry.get())
-        except ValueError:
-            self.log("Not a number: " + self.speed_entry.get(), "error")
+    def on_pair_drive(self):
+        live = [n for n, p in self.panels.items() if p.online]
+        if len(live) < 2:
+            self.log("Paired drive needs both motors online", "warn")
             return
-        self.speed_var.set(max(-self.max_rpm, min(self.max_rpm, rpm)))
-        self._send_rpm(rpm)
-
-    def _send_rpm(self, rpm):
-        if not self.armed and rpm != 0:
-            self.log("Arm the drive before commanding a speed", "warn")
+        armed = [n for n, p in self.panels.items() if p.armed]
+        forward, turn = float(self.forward_var.get()), float(self.turn_var.get())
+        if len(armed) < 2 and (forward or turn):
+            self.log("Arm both motors before driving them together", "warn")
             return
-        if rpm == self._last_sent_rpm:
-            return
-        self._last_sent_rpm = rpm
-        self.send("velocity", rpm=rpm)
+        self.send("pair_velocity", forward=forward, turn=turn, invert=bool(self.invert_var.get()))
 
     def on_close(self):
-        if self.armed:
-            self.log("Closing - stopping and disarming", "warn")
-        self.send("stop")
-        self.send("disarm")
+        if self._closing:
+            return
+        self._closing = True
+        self.log("Closing - stopping and disarming every motor", "warn")
+        self.send("stop", motor=ALL)
+        self.send("disarm", motor=ALL)
         self.send("disconnect")
         self.send("quit")
-        self.root.after(600, self.root.destroy)
+        self.root.after(4000, self.root.destroy)     # backstop if the worker hangs
 
     # ---------------------------------------------------------------- events
 
@@ -486,100 +683,79 @@ class MotorGUI():
         self.root.after(POLL_UI_MS, self._drain_events)
 
     def _handle_event(self, kind, payload):
+        panel = None
+        if isinstance(payload, dict) and payload.get("motor") in self.panels:
+            panel = self.panels[payload["motor"]]
+
         if kind == "log":
             self.log(payload["text"], payload.get("level", "info"))
+        elif kind == "motor_online" and panel:
+            panel.set_max_rpm(payload["max_rpm"])
+            panel.set_online(True, "node %d on %s" % (payload["node_id"], payload["adapter"]))
+            if payload.get("mode") is not None:
+                panel.set_mode(payload["mode"])
+        elif kind == "motor_offline" and panel:
+            panel.set_online(False, error=payload.get("error", ""))
         elif kind == "connected":
             self.connected = True
-            self.max_rpm = payload["max_rpm"]
-            self.slider.configure(from_=-self.max_rpm, to=self.max_rpm)
-            self.conn_label.configure(
-                text="%s  node %d  via %s" % (payload["motor"], payload["node_id"],
-                                              payload["profile"]), fg=COLOR_OK)
+            self.pairing = payload.get("pairing", {})
+            self.invert_var.set(bool(self.pairing.get("invert_right_for_forward", True)))
+            live = payload.get("motors", [])
+            self.conn_label.configure(text="connected: " + ", ".join(live) if live
+                                      else "connected, no motor online",
+                                      fg=COLOR_OK if live else COLOR_FAULT)
             self.connect_btn.configure(text="Disconnect")
-            if payload.get("mode") is not None:
-                self._set_mode_box(payload["mode"])
+            limits = [p.max_rpm for p in self.panels.values() if p.online]
+            if limits:
+                bound = min(limits)
+                self.forward_slider.configure(from_=-bound, to=bound)
+                self.turn_slider.configure(from_=-bound / 3.0, to=bound / 3.0)
             self._update_widget_states()
         elif kind == "disconnected":
             self.connected = False
-            self.armed = False
+            for name, p in self.panels.items():
+                p.set_online(False)
             self.conn_label.configure(text="disconnected", fg=COLOR_MUTED)
             self.connect_btn.configure(text="Connect")
-            self._clear_feedback()
             self._update_widget_states()
-        elif kind == "armed":
-            self.armed = bool(payload)
-            self.armed_label.configure(text="ARMED" if self.armed else "DISARMED",
-                                       fg=COLOR_FAULT if self.armed else COLOR_MUTED)
-            if not self.armed:
-                self._last_sent_rpm = None
+        elif kind == "armed" and panel:
+            panel.set_armed(payload.get("armed"))
             self._update_widget_states()
-        elif kind == "target":
-            self.target_label.configure(text="target %.1f rpm" % float(payload))
-        elif kind == "mode":
-            self._set_mode_box(payload)
-        elif kind == "feedback":
-            self._show_feedback(payload)
-        elif kind == "preflight":
-            if not payload.get("ok"):
-                messagebox.showwarning("Preflight failed", "\n".join(payload["problems"]))
-
-    def _set_mode_box(self, mode):
-        for text in self.mode_box["values"]:
-            if text.startswith(str(mode)):
-                self.mode_var.set(text)
-                return
-
-    def _show_feedback(self, data):
-        for key, _ in self.FIELDS:
-            value = data.get(key)
-            if key in ("error_code", "fault_code") and isinstance(value, int):
-                text = "0x%04X" % value
-            elif isinstance(value, float):
-                text = "%.2f" % value
-            else:
-                text = str(value)
-            label = self.value_labels[key]
-            label.configure(text=text)
-
-        state_label = self.value_labels["state"]
-        if data.get("fault"):
-            state_label.configure(fg=COLOR_FAULT)
-        elif data.get("state") == "OPERATION_ENABLED":
-            state_label.configure(fg=COLOR_OK)
-        else:
-            state_label.configure(fg=COLOR_TEXT)
-
-        for key in ("error_code", "fault_code"):
-            self.value_labels[key].configure(
-                fg=COLOR_FAULT if data.get(key) else COLOR_TEXT)
-
-    def _clear_feedback(self):
-        for label in self.value_labels.values():
-            label.configure(text="-", fg=COLOR_TEXT)
+        elif kind == "target" and panel:
+            panel.set_target(payload.get("rpm", 0.0))
+        elif kind == "mode" and panel:
+            panel.set_mode(payload.get("mode"))
+        elif kind == "feedback" and panel:
+            panel.show_feedback(payload)
+        elif kind == "preflight" and panel and not payload.get("ok"):
+            self.log("[" + payload["motor"] + "] preflight failed", "error")
+        elif kind == "shutdown_done":
+            if self._closing:
+                self.root.destroy()
 
     def _update_widget_states(self):
-        on = "normal" if self.connected else "disabled"
-        for widget in (self.arm_btn, self.disarm_btn, self.fault_btn, self.mode_box,
-                       self.send_btn, self.speed_entry):
-            widget.configure(state=on if widget is not self.mode_box else
-                             ("readonly" if self.connected else "disabled"))
-        self.slider.configure(state="normal" if self.connected else "disabled")
-        self.arm_btn.configure(state="disabled" if (self.armed or not self.connected)
-                               else "normal")
-        self.profile_box.configure(state="disabled" if self.connected else "readonly")
-        self.motor_box.configure(state="disabled" if self.connected else "readonly")
+        live = [n for n, p in self.panels.items() if p.online]
+        both = len(live) >= 2
+        for widget in (self.forward_slider, self.turn_slider):
+            widget.configure(state="normal" if both else "disabled")
+        self.arm_both_btn.configure(state="normal" if both else "disabled")
+        self.disarm_both_btn.configure(state="normal" if live else "disabled")
+        self.stop_btn.configure(state="normal" if live else "disabled")
+        for panel in self.panels.values():
+            panel.update_widget_states()
 
     def log(self, message, level="info"):
-        stamp = time.strftime("%H:%M:%S")
-        self.log_text.insert("end", "[%s] %s\n" % (stamp, message), level)
+        self.log_text.insert("end", "[%s] %s\n" % (time.strftime("%H:%M:%S"), message), level)
         self.log_text.see("end")
 
 
 def main():
     parser = argparse.ArgumentParser(description="AIMOTOR CANopen control GUI")
     parser.add_argument("--config", default=None, help="Path to aimotor_config.json")
-    parser.add_argument("--profile", default=None, help="Adapter profile from the config")
-    parser.add_argument("--motor", default="AIMotor_1", help="Motor name from the config")
+    parser.add_argument("--profile", default=None, help="Override the adapter profile")
+    parser.add_argument("--motors", nargs="*", default=None,
+                        help="Motor names to show (default: every enabled motor)")
+    parser.add_argument("--motor", default=None, help="Show a single motor only")
     parser.add_argument("--self-test", action="store_true",
                         help="Build the window, connect, then close automatically")
     args = parser.parse_args()
@@ -589,8 +765,8 @@ def main():
 
     if args.self_test:
         gui.on_connect()
-        root.after(6000, gui.on_close)
-        root.after(9000, root.destroy)
+        root.after(8000, gui.on_close)
+        root.after(14000, root.destroy)
 
     root.mainloop()
     return 0

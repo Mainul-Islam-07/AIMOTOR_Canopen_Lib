@@ -3,7 +3,8 @@
 ```bash
 cd Examples
 python example_05_gui.py
-python example_05_gui.py --profile canalystii --motor AIMotor_2
+python example_05_gui.py --motors Left Right
+python example_05_gui.py --motor Left          # single panel
 ```
 
 Tkinter only, no extra dependencies.

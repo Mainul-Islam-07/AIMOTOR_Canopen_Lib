@@ -14,7 +14,10 @@ Two more overrides exist so a second machine needs no file edits:
 
 | Key | Meaning | What it replaced in JS2 |
 |---|---|---|
-| `profile` | which entry of `adapters` to use | the fixed `socketcan` in `Drive_CAN_Config.json` |
+| `profile` | default adapter for motors that do not name one | the fixed `socketcan` in `Drive_CAN_Config.json` |
+| `adapters.<name>.serial` | USB serial that pins a profile to one physical adapter | nothing - gs_usb index order is not stable |
+| `motors.<name>.adapter` | which adapter (bus) this motor is on | nothing - JS2 had one bus |
+| `pairing` | which motor is left/right, and whether the right one is mirrored | nothing |
 | `paths.base_dir` | library root; `null` means this package. Relative paths resolve against the config file | the hardcoded `/home/jontro_soinik_2_0-2/...` paths |
 | `paths.eds_dir` | folder holding the EDS file | `file_navigator("Motor_Mapping", eds_file)` |
 | `adapters.<name>` | python-can keyword arguments, passed to `canopen.Network.connect` | `{socketcan, can_drive, 1000000}` |
@@ -33,27 +36,44 @@ Two more overrides exist so a second machine needs no file edits:
 - `pulses_per_rev`: 1000 unless H05-07 / H05-09 were changed on the drive.
   Every rpm conversion depends on it.
 - `rated_torque_nm`: only used to print Nm. Leave it 0 to report % of rated only.
-  The shipped 0.32 is a placeholder — set it from your motor's data sheet.
-- `limits.enforce_in_software`: keep it `true`. This drive has no limit object,
-  so nothing else will stop a bad command.
+  Shipped as 2.39, read from the drive itself (H00_12 = 2390 in 0.001 Nm units).
+- `limits.max_velocity_rpm`: shipped as 3000, the motor's **rated** speed
+  (H00_14). The drive's own hard ceiling is 3600 rpm (H00_15), which it
+  enforces itself and which preflight warns about if you exceed it. Running
+  continuously above rated speed is what the nameplate is warning you about.
+- `limits.enforce_in_software`: keep it `true`. CiA402 `0x6072`/`0x6080` do not
+  exist on this drive, so nothing in the CANopen profile stops a bad command.
 - `heartbeat.enabled`: `false` by default, matching the drive's factory `0x1017 = 0`.
 - `abort_if_not_canopen_mode`: stops everything when H02-00 is not 8.
 - `shutdown.os_exit_after_disconnect`: `true` for CANable2 to dodge the libusb
   teardown crash; safe because the motor is disarmed first. Set `false` on
   CANalyst-II if you want a normal interpreter exit.
 
-## Adding the second motor
+## Two motors on two adapters
 
 ```json
-"AIMotor_2": {
-    "node_id": 2,
-    "enabled": true,
-    "limits": { "max_velocity_rpm": 200.0 }
+"motors": {
+    "Left":  { "node_id": 1, "enabled": true, "adapter": "canable2_left"  },
+    "Right": { "node_id": 2, "enabled": true, "adapter": "canable2_right",
+               "limits": { "max_velocity_rpm": 2000.0 } }
 }
 ```
 
-The entry merges over `motor_defaults`, so list only the differences. Two
-enabled motors may not share a node id; the loader raises if they do.
+Each entry merges over `motor_defaults`, so list only the differences. A node
+id has to be unique **per adapter**: two motors on the same bus may not share
+one and the loader raises, while two motors on different buses legitimately
+can.
+
+Omit `adapter` and the motor falls back to the top-level `profile`, which is
+how a single-bus setup keeps working unchanged.
+
+## Pinning an adapter by USB serial
+
+`gs_usb` index order follows USB enumeration, so a replug can swap two
+adapters and send Left's commands to the Right motor. Give each profile the
+adapter's `serial` (from `Examples/example_00_list_adapters.py`) and the
+library resolves it to a stable bus/address at connect time; `index` is then
+ignored. Leave `serial` out and it falls back to `index`.
 
 ## Moving the library
 

@@ -43,9 +43,28 @@ class OD():
     VENDOR_ID = ODEntry(0x1018, 1, "Vendor Id", "u32", "ro")
     PRODUCT_CODE = ODEntry(0x1018, 2, "Product Code", "u32", "ro")
 
+    # --- manufacturer: motor nameplate, group H00 (read only) -------------
+    # Read live from the drive: 48 V, 19.00 A, 2.39 Nm, 3000 rpm, 3600 rpm.
+    RATED_VOLTAGE = ODEntry(0x2000, 0x0A, "H00_09 rated voltage", "u16", "ro", "V")
+    RATED_CURRENT = ODEntry(0x2000, 0x0C, "H00_11 rated current", "u16", "ro", "0.01A")
+    RATED_TORQUE = ODEntry(0x2000, 0x0D, "H00_12 rated torque", "u16", "ro", "0.001Nm")
+    RATED_SPEED = ODEntry(0x2000, 0x0F, "H00_14 rated speed", "u16", "ro", "rpm")
+    MAX_SPEED = ODEntry(0x2000, 0x10, "H00_15 max speed", "u16", "ro", "rpm")
+
     # --- manufacturer: control mode selection ----------------------------
     # H02_00 must be 8 for CANopen control, set with the RS485 tool.
     H02_00_CONTROL_MODE = ODEntry(0x2002, 0x01, "H02_00 control mode", "u16", "rw")
+
+    # --- manufacturer: communication group H0C ----------------------------
+    # H0C_00 is the node id (and the RS485 address). H0C_08 is the CAN
+    # bitrate code: 5 = 500 kbps, 6 = 1 Mbps. Write H0C_13 = 1 to save to
+    # EEPROM, then power-cycle. Changing either one over CAN drops the
+    # connection you are using, so set them over RS485.
+    NODE_ID = ODEntry(0x200C, 0x01, "H0C_00 node id", "u16", "rw")
+    RS485_BAUD = ODEntry(0x200C, 0x03, "H0C_02 RS485 baud", "u16", "rw")
+    RS485_FORMAT = ODEntry(0x200C, 0x04, "H0C_03 RS485 data format", "u16", "rw")
+    CAN_BITRATE = ODEntry(0x200C, 0x09, "H0C_08 CAN bitrate", "u16", "rw")
+    SAVE_TO_EEPROM = ODEntry(0x200C, 0x0E, "H0C_13 save to EEPROM", "u16", "rw")
 
     # --- manufacturer: monitoring group H0B (read only) -------------------
     MOTOR_SPEED_RPM = ODEntry(0x200B, 0x01, "H0B_00 motor speed", "i16", "ro", "rpm")

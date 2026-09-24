@@ -65,6 +65,20 @@ Whole-word values from the manual's state transition table:
 Manufacturer parameters follow the rule: index = `0x2000 + group number`,
 subindex = `in-group offset + 1`. So H0B_26 is `0x200B` subindex `0x1B`.
 
+## Motor nameplate, group H00 (read only)
+
+| Object | Meaning | Unit | This motor |
+|---|---|---|---|
+| `0x2000:0A` (H00_09) | rated voltage | V | 48 |
+| `0x2000:0C` (H00_11) | rated current | 0.01 A | 19.0 A |
+| `0x2000:0D` (H00_12) | rated torque | 0.001 Nm | 2.39 Nm |
+| `0x2000:0F` (H00_14) | rated speed | rpm | 3000 |
+| `0x2000:10` (H00_15) | **max speed** | rpm | 3600 |
+
+H00_15 is the drive's own speed ceiling and has the highest priority, so it
+applies whatever you write over CANopen. `preflight()` reads these and warns
+when `limits.max_velocity_rpm` exceeds H00_15.
+
 ## Reading fault history
 
 ```python

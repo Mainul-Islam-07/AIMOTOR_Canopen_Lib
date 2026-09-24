@@ -96,6 +96,25 @@ class Motor_CANopen_Lib():
             report["problems"].append(message)
             self.log.print(message, "ERROR", "0x2002:01", "Motor_CANopen_Lib", "preflight")
 
+        # Motor nameplate, and a cross-check of the configured speed limit
+        # against the drive's own hard limit (H00_15, highest priority).
+        rated_speed = self.io.read(OD.RATED_SPEED)
+        max_speed = self.io.read(OD.MAX_SPEED)
+        rated_torque = self.io.read(OD.RATED_TORQUE)
+        rated_current = self.io.read(OD.RATED_CURRENT)
+        report["rated_speed_rpm"] = rated_speed
+        report["max_speed_rpm"] = max_speed
+        report["rated_torque_nm"] = (rated_torque / 1000.0) if rated_torque else None
+        report["rated_current_a"] = (rated_current / 100.0) if rated_current else None
+
+        configured_limit = float(self.settings.limits.get("max_velocity_rpm", 0) or 0)
+        report["configured_limit_rpm"] = configured_limit
+        if max_speed and configured_limit > max_speed:
+            message = ("Configured max_velocity_rpm %.0f exceeds the drive's own limit "
+                       "H00_15 = %d rpm. The drive will cap it." % (configured_limit, max_speed))
+            report["problems"].append(message)
+            self.log.print(message, "WARNING", "LIMIT", "Motor_CANopen_Lib", "preflight")
+
         statusword = self.io.read(OD.STATUSWORD)
         report["statusword"] = statusword
         report["state"] = Map.decode_state(statusword or 0).name

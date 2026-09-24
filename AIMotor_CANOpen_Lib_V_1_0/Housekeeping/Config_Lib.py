@@ -98,7 +98,12 @@ class Config():
     # ----------------------------------------------------------------- lookup
 
     def adapter(self, profile: Optional[str] = None) -> dict:
-        """python-can keyword arguments for the selected adapter profile."""
+        """Adapter settings for a profile.
+
+        Keeps the meta keys (profile_name, serial) in the dict; they are
+        stripped before the settings reach python-can - see
+        CANopen_Network.Adapter_Resolve_Lib.resolve_adapter_kwargs.
+        """
         name = profile or self.profile
         adapters = self.raw.get("adapters", {})
         if name not in adapters:
@@ -107,6 +112,34 @@ class Config():
         settings = {k: v for k, v in adapters[name].items() if not k.startswith(("notes", "_"))}
         settings["profile_name"] = name
         return settings
+
+    def motor_adapter(self, name: str, override: Optional[str] = None) -> str:
+        """Which adapter profile a motor lives on.
+
+        Precedence: explicit override (--profile), then the motor's own
+        "adapter" key, then the global default profile. A motor without an
+        "adapter" key keeps the old single-bus behaviour.
+        """
+        if override:
+            return override
+        entry = self.motors.get(name, {}) or {}
+        return entry.get("adapter") or self.profile
+
+    def motor_adapters(self, enabled_only: bool = True) -> dict:
+        """{motor_name: adapter_profile} for the motors in play."""
+        return {name: self.motor_adapter(name) for name in self.motor_names(enabled_only)}
+
+    def adapter_names_in_use(self, enabled_only: bool = True) -> list:
+        """Distinct adapter profiles needed, in motor order. One bus each."""
+        seen = []
+        for profile in self.motor_adapters(enabled_only).values():
+            if profile not in seen:
+                seen.append(profile)
+        return seen
+
+    def pairing(self) -> dict:
+        """Left/right pairing used by the paired drive controls."""
+        return self.raw.get("pairing", {}) or {}
 
     def motor_names(self, enabled_only: bool = True) -> list:
         names = []
@@ -130,20 +163,62 @@ class Config():
 
     # --------------------------------------------------------------- checking
 
+    KNOWN_BITRATES = (125000, 250000, 500000, 800000, 1000000)
+
     def validate(self) -> list:
         """Return a list of warning strings; raise only on unusable configuration."""
         warnings = []
-        adapter = self.adapter()
-        if adapter.get("interface") == "gs_usb" and adapter.get("bitrate") != 500000:
-            warnings.append("gs_usb adapter at " + str(adapter.get("bitrate")) +
-                            " bps: only 500000 is known to work on this PC.")
+        adapters = self.raw.get("adapters", {})
+
         for name, entry in self.motors.items():
             node_id = entry.get("node_id")
             if not isinstance(node_id, int) or not (1 <= node_id <= 127):
                 raise ValueError("Motor '" + name + "' has an invalid node_id: " + str(node_id))
-        node_ids = [e.get("node_id") for e in self.motors.values() if e.get("enabled", True)]
-        if len(node_ids) != len(set(node_ids)):
-            raise ValueError("Two enabled motors share the same node_id: " + str(node_ids))
+            profile = entry.get("adapter")
+            if profile and profile not in adapters:
+                raise ValueError("Motor '" + name + "' names adapter '" + str(profile) +
+                                 "', which does not exist. Available: " +
+                                 ", ".join(sorted(adapters)))
+
+        # A node id only has to be unique on its own bus. Two motors on two
+        # separate adapters may legitimately share one.
+        seen = {}
+        for name in self.motor_names(enabled_only=True):
+            key = (self.motor_adapter(name), self.motors[name].get("node_id"))
+            if key in seen:
+                raise ValueError("Motors '" + seen[key] + "' and '" + name + "' are both node " +
+                                 str(key[1]) + " on adapter '" + str(key[0]) + "'")
+            seen[key] = name
+
+        in_use = self.adapter_names_in_use(enabled_only=True)
+        gs_usb_slots = {}
+        for profile in in_use:
+            settings = self.adapter(profile)
+            bitrate = settings.get("bitrate")
+            if bitrate not in self.KNOWN_BITRATES:
+                warnings.append("Adapter '" + profile + "' at " + str(bitrate) +
+                                " bps is an unusual bitrate.")
+            if settings.get("interface") == "gs_usb":
+                if bitrate == 250000:
+                    warnings.append("Adapter '" + profile + "' is gs_usb at 250000 bps, which "
+                                    "crashes libusb on this PC.")
+                slot = settings.get("serial") or ("index:" + str(settings.get("index", 0)))
+                if slot in gs_usb_slots:
+                    raise ValueError("Adapters '" + gs_usb_slots[slot] + "' and '" + profile +
+                                     "' both point at the same physical device (" + str(slot) +
+                                     "). Give each one its own index or serial.")
+                gs_usb_slots[slot] = profile
+                if not settings.get("serial") and len(in_use) > 1:
+                    warnings.append("Adapter '" + profile + "' has no serial. gs_usb index "
+                                    "order is not stable across replug - set 'serial' to pin "
+                                    "each adapter to its motor.")
+
+        if len(self.motor_names(enabled_only=True)) > 1 and \
+                self.shutdown.get("os_exit_after_disconnect"):
+            warnings.append("shutdown.os_exit_after_disconnect is true with more than one motor: "
+                            "exiting during teardown can leave another motor armed. Motor_Group "
+                            "disables it.")
+
         self.warnings = warnings
         return warnings
 
